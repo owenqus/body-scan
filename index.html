@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#0b1020" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Body Scan" />
+  <title>Body Scan V0.1 Mobile</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">TAILORING BODY SCAN · MOBILE V0.1</p>
+        <h1>iPhone 人体量体原型</h1>
+        <p class="subtitle">手机四视角扫描 → 人体轮廓 + 姿态 → 初步尺寸 → 3D体型代理模型</p>
+      </div>
+      <div id="modelStatus" class="status-pill loading">模型未加载</div>
+    </header>
+
+    <section class="card setup-card">
+      <h2>1. 测试设置</h2>
+      <div class="form-grid">
+        <label>
+          <span>真实身高（cm）</span>
+          <input id="heightCm" type="number" min="120" max="230" step="0.1" value="178" inputmode="decimal" />
+        </label>
+        <label>
+          <span>测试编号</span>
+          <input id="subjectId" type="text" value="TEST-001" autocapitalize="characters" />
+        </label>
+        <label>
+          <span>摄像头</span>
+          <select id="cameraMode">
+            <option value="environment" selected>后置摄像头（推荐，精度更好）</option>
+            <option value="user">前置摄像头（自己测试更方便）</option>
+          </select>
+        </label>
+        <label>
+          <span>自动扫描倒计时</span>
+          <select id="countdownSeconds">
+            <option value="5">5 秒</option>
+            <option value="7" selected>7 秒</option>
+            <option value="10">10 秒</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">第一次自己测试，可以先选前置摄像头；正式精度测试优先用后置摄像头。手机竖屏固定在支架上，镜头大致在腰到胸高度。</p>
+    </section>
+
+    <section class="card scan-card">
+      <div class="section-title-row">
+        <div>
+          <h2>2. 扫描</h2>
+          <p class="hint">穿贴身衣物，头顶和脚底必须完整入镜。推荐离手机约 2.5–4 米。</p>
+        </div>
+        <button id="startCameraBtn" class="primary">开启摄像头</button>
+      </div>
+
+      <div class="camera-layout">
+        <div id="cameraStage" class="camera-stage">
+          <video id="camera" playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div class="body-guide" aria-hidden="true"></div>
+          <div id="scanCountdown" class="scan-countdown hidden" aria-live="assertive"></div>
+          <div id="liveHint" class="live-hint">等待摄像头</div>
+        </div>
+
+        <aside class="capture-panel">
+          <div id="viewGuide" class="view-guide">
+            <span class="view-kicker">当前视角</span>
+            <strong id="currentViewName">正面</strong>
+            <p id="currentViewInstruction">面向摄像头，双脚自然分开，双臂离开躯干约 15–25°。</p>
+          </div>
+
+          <button id="autoScanBtn" class="capture" disabled>开始自动四视角扫描</button>
+          <button id="captureBtn" class="secondary" disabled>手动拍摄当前视角</button>
+          <button id="resetBtn" class="secondary">重新开始</button>
+          <div id="qualityBox" class="quality-box">尚未采集</div>
+        </aside>
+      </div>
+
+      <div id="viewStrip" class="view-strip"></div>
+    </section>
+
+    <section class="card result-card">
+      <div class="section-title-row">
+        <div>
+          <h2>3. 初步量体结果</h2>
+          <p class="hint">这是工程验证数据，不是生产版尺寸。先与版师手工量体做对照。</p>
+        </div>
+        <button id="computeBtn" class="primary" disabled>计算尺寸</button>
+      </div>
+
+      <div id="measurementGrid" class="measurement-grid empty-state">
+        完成至少“正面 + 右侧”后即可计算。
+      </div>
+
+      <div class="action-row">
+        <button id="downloadJsonBtn" class="secondary" disabled>导出 JSON</button>
+        <button id="downloadCsvBtn" class="secondary" disabled>导出验证 CSV</button>
+      </div>
+    </section>
+
+    <section class="card model-card">
+      <div>
+        <h2>4. 3D 体型代理模型</h2>
+        <p class="hint">V0.1 先用胸/腰/臀宽度和侧面厚度生成代理模型。V0.2 再进入 360° 多视角人体 Mesh。</p>
+      </div>
+      <div id="threeContainer" class="three-container">
+        <div class="empty-3d">计算尺寸后生成 3D 模型</div>
+      </div>
+    </section>
+
+    <section class="card warning-card">
+      <h2>这版只验证“能不能稳定量”</h2>
+      <p>V0.1 先验证重复扫描是否稳定、与版师软尺量体误差有多大、肩部和躯干形态能否被可靠识别。通过后再做 360° 视频、数字号衣和改版引擎。</p>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
