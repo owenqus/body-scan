@@ -1,0 +1,30 @@
+name: BodyScan
+options:
+  bundleIdPrefix: com.owenqus
+  deploymentTarget:
+    iOS: "17.0"
+
+packages:
+  MediaPipe:
+    url: https://github.com/google-ai-edge/mediapipe
+    branch: master
+
+targets:
+  BodyScan:
+    type: application
+    platform: iOS
+    sources:
+      - path: BodyScan
+    info:
+      path: BodyScan/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.owenqus.BodyScan
+        PRODUCT_NAME: BodyScan
+        SWIFT_VERSION: 5.0
+        TARGETED_DEVICE_FAMILY: 1
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: MediaPipe
+        product: MediaPipeTasksVision
