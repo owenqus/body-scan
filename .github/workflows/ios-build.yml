@@ -23,12 +23,12 @@ jobs:
       - name: Resolve packages
         run: xcodebuild -resolvePackageDependencies -project ios/BodyScan.xcodeproj -scheme BodyScan
 
-      - name: Build for iOS Simulator
+      - name: Build for generic iPhone
         run: >-
           xcodebuild
           -project ios/BodyScan.xcodeproj
           -scheme BodyScan
-          -sdk iphonesimulator
-          -destination 'generic/platform=iOS Simulator'
+          -sdk iphoneos
+          -destination 'generic/platform=iOS'
           CODE_SIGNING_ALLOWED=NO
           build
