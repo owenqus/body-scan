@@ -12,19 +12,54 @@ struct Point3D: Codable, Hashable {
     }
 }
 
+struct CrossSectionMeasurement: Codable {
+    var yCmRelativePelvis: Double
+    var perimeterCm: Double
+    var widthCm: Double
+    var depthCm: Double
+    var sampleCount: Int
+    var hullPointCount: Int
+    var confidence: Double
+}
+
 struct TailoringMetrics: Codable {
     var visionBodyHeightCm: Double?
     var shoulderWidthCm: Double?
     var shoulderHeightDifferenceCm: Double?
     var leftArmLengthCm: Double?
     var rightArmLengthCm: Double?
+    var skeletonAgreementCm: Double?
+
+    var chestCircumferenceCm: Double?
+    var waistCircumferenceCm: Double?
+    var hipCircumferenceCm: Double?
+
+    var chestWidthCm: Double?
+    var chestDepthCm: Double?
+    var waistWidthCm: Double?
+    var waistDepthCm: Double?
+    var hipWidthCm: Double?
+    var hipDepthCm: Double?
+
+    var sectionConfidence: Double?
 
     static let empty = TailoringMetrics(
         visionBodyHeightCm: nil,
         shoulderWidthCm: nil,
         shoulderHeightDifferenceCm: nil,
         leftArmLengthCm: nil,
-        rightArmLengthCm: nil
+        rightArmLengthCm: nil,
+        skeletonAgreementCm: nil,
+        chestCircumferenceCm: nil,
+        waistCircumferenceCm: nil,
+        hipCircumferenceCm: nil,
+        chestWidthCm: nil,
+        chestDepthCm: nil,
+        waistWidthCm: nil,
+        waistDepthCm: nil,
+        hipWidthCm: nil,
+        hipDepthCm: nil,
+        sectionConfidence: nil
     )
 }
 
@@ -32,8 +67,10 @@ struct PoseFrameRecord: Codable {
     var timestamp: TimeInterval
     var appleJoints: [String: Point3D]
     var mediaPipeWorldJoints: [Point3D]
+    var fusedJoints: [String: Point3D]
     var bodyYawDegrees: Double?
     var bodyHeightEstimateMeters: Float?
+    var skeletonAgreementCm: Double?
 }
 
 struct ScanExport: Codable {
@@ -49,6 +86,9 @@ struct ScanExport: Codable {
     var personDepthAvailable: Bool
     var lidarSceneDepthAvailable: Bool
     var latestMetrics: TailoringMetrics
+    var chestSection: CrossSectionMeasurement?
+    var waistSection: CrossSectionMeasurement?
+    var hipSection: CrossSectionMeasurement?
     var poseFrames: [PoseFrameRecord]
     var pointCloud: [Point3D]
 }
