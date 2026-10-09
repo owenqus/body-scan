@@ -33,7 +33,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Body Scan V0.2")
+                Text("Body Scan V0.3")
                     .font(.headline)
                 Text(scanner.statusText)
                     .font(.caption)
@@ -106,6 +106,19 @@ struct ContentView: View {
                 metricChip("肩差", scanner.latestMetrics.shoulderHeightDifferenceCm)
                 metricChip("左臂", scanner.latestMetrics.leftArmLengthCm)
                 metricChip("右臂", scanner.latestMetrics.rightArmLengthCm)
+            }
+
+            HStack(spacing: 8) {
+                metricChip("胸围", scanner.latestMetrics.chestCircumferenceCm)
+                metricChip("腰围", scanner.latestMetrics.waistCircumferenceCm)
+                metricChip("臀围", scanner.latestMetrics.hipCircumferenceCm)
+                metricChip("骨架差", scanner.latestMetrics.skeletonAgreementCm)
+            }
+
+            if let confidence = scanner.latestMetrics.sectionConfidence {
+                Text("3D截面置信度 \(Int(confidence * 100))% · 需与版师实测校准")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             Text(scanner.mediaPipeStatus)
