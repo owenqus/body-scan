@@ -410,13 +410,13 @@ final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
             let fy = intrinsics.columns.1.y
             let cx = intrinsics.columns.2.x
             let cy = intrinsics.columns.2.y
-            let stride = 6
+            let sampleStep = 6
 
             var newPoints: [Point3D] = []
-            newPoints.reserveCapacity((depthWidth / stride) * (depthHeight / stride) / 3)
+            newPoints.reserveCapacity((depthWidth / sampleStep) * (depthHeight / sampleStep) / 3)
 
-            for y in stride(from: 0, to: depthHeight, by: stride) {
-                for x in stride(from: 0, to: depthWidth, by: stride) {
+            for y in stride(from: 0, to: depthHeight, by: sampleStep) {
+                for x in stride(from: 0, to: depthWidth, by: sampleStep) {
                     if let maskBase, maskWidth > 0, maskHeight > 0 {
                         let mx = min(maskWidth - 1, x * maskWidth / depthWidth)
                         let my = min(maskHeight - 1, y * maskHeight / depthHeight)
