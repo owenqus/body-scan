@@ -4,7 +4,7 @@ import MediaPipeTasksVision
 import UIKit
 
 final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
-    var onResult: (([Point3D]) -> Void)?
+    var onResult: (([Point3D], Int) -> Void)?
     var onStatus: ((String) -> Void)?
 
     private let modelURL = URL(string: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task")!
@@ -89,7 +89,7 @@ final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
         }
 
         DispatchQueue.main.async {
-            self.onResult?(points)
+            self.onResult?(points, timestampInMilliseconds)
         }
     }
 
