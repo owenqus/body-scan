@@ -33,7 +33,7 @@ struct ContentView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Body Scan V0.3")
+                Text("Body Scan V0.3.1")
                     .font(.headline)
                 Text(scanner.statusText)
                     .font(.caption)
@@ -116,7 +116,7 @@ struct ContentView: View {
             }
 
             if let confidence = scanner.latestMetrics.sectionConfidence {
-                Text("3D截面置信度 \(Int(confidence * 100))% · 需与版师实测校准")
+                Text("截面采样完整度 \(Int(confidence * 100))% · 不是测量准确率")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -137,6 +137,7 @@ struct ContentView: View {
                     .keyboardType(.decimalPad)
                     .multilineTextAlignment(.trailing)
                     .frame(width: 90)
+                    .disabled(scanner.isScanning || scanner.isProcessing)
                 Text("cm")
                     .foregroundStyle(.secondary)
             }
@@ -152,7 +153,7 @@ struct ContentView: View {
                     scanner.beginScan()
                 }
             } label: {
-                Text(scanner.isScanning ? "结束扫描" : "开始 360° 扫描")
+                Text(scanner.isProcessing ? "处理中…" : scanner.isScanning ? "结束扫描" : "开始 360° 扫描")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 13)
@@ -160,12 +161,14 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(scanner.isScanning ? .red : .white)
             .foregroundStyle(scanner.isScanning ? .white : .black)
+            .disabled(scanner.isProcessing)
 
             HStack {
                 Button("重置") {
                     scanner.resetScan()
                 }
                 .buttonStyle(.bordered)
+                .disabled(scanner.isProcessing)
 
                 Spacer()
 

@@ -1,5 +1,11 @@
 import Foundation
 
+struct PoseLandmark3D {
+    var point: Point3D
+    var visibility: Float
+    var presence: Float
+}
+
 struct Point3D: Codable, Hashable {
     var x: Float
     var y: Float
@@ -20,6 +26,8 @@ struct CrossSectionMeasurement: Codable {
     var sampleCount: Int
     var hullPointCount: Int
     var confidence: Double
+    var angularCoverage: Double = 0
+    var largestGapDegrees: Double = 360
 }
 
 struct TailoringMetrics: Codable {
@@ -71,6 +79,10 @@ struct PoseFrameRecord: Codable {
     var bodyYawDegrees: Double?
     var bodyHeightEstimateMeters: Float?
     var skeletonAgreementCm: Double?
+    var heightIsMeasured: Bool = false
+    var skeletonScale: Float = 1
+    var cameraTransform: [Float] = []
+    var cameraIntrinsics: [Float] = []
 }
 
 struct ScanExport: Codable {
@@ -91,4 +103,9 @@ struct ScanExport: Codable {
     var hipSection: CrossSectionMeasurement?
     var poseFrames: [PoseFrameRecord]
     var pointCloud: [Point3D]
+    var depthSource: String = "none"
+    var rejectedFrames: [String: Int] = [:]
+    var acceptedDepthFrames: Int = 0
+    var measurementWarnings: [String] = []
+    var depthScaleApplied: Float = 1
 }

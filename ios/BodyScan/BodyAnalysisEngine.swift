@@ -38,7 +38,10 @@ enum BodyAnalysisEngine {
             let aRightHip = apple["rightHip"],
             let aLeftShoulder = apple["leftShoulder"],
             let aRightShoulder = apple["rightShoulder"],
-            mediaPipe.count > 28
+            mediaPipe.count > 28,
+            appleCalibrationScale.isFinite, appleCalibrationScale > 0,
+            apple.values.allSatisfy(ScanGeometry.isFinite),
+            mediaPipe.allSatisfy({ ScanGeometry.isFinite(SIMD3<Float>($0.x, $0.y, $0.z)) })
         else { return nil }
 
         let calibratedApple = apple.mapValues { point -> SIMD3<Float> in
@@ -92,8 +95,12 @@ enum BodyAnalysisEngine {
                     if name.contains("Shoulder") || name.contains("Hip") { return 0.72 }
                     return 0.62
                 }()
-                fused[name] = a * appleWeight + m * (1 - appleWeight)
-                agreementDistances.append(simd_distance(a, m))
+                let disagreement = simd_distance(a, m)
+                // Alignment alone is not evidence of a good second estimate.
+                // Do not let an implausible limb pull a valid Apple joint away.
+                fused[name] = disagreement <= 0.08
+                    ? a * appleWeight + m * (1 - appleWeight) : a
+                agreementDistances.append(disagreement)
             case let (a?, nil):
                 fused[name] = a
             case let (nil, m?):
@@ -166,7 +173,10 @@ enum BodyAnalysisEngine {
         shoulderWidthMeters: Double,
         angularCoverage: Double
     ) -> SectionAnalysis {
-        guard canonicalPoints.count > 500, torsoHeightMeters > 0.25 else {
+        guard canonicalPoints.count > 500, torsoHeightMeters.isFinite,
+              (0.25...0.9).contains(torsoHeightMeters), shoulderWidthMeters.isFinite,
+              (0.20...0.75).contains(shoulderWidthMeters), angularCoverage.isFinite,
+              angularCoverage >= 0.875 else {
             return SectionAnalysis(chest: nil, waist: nil, hip: nil)
         }
 
@@ -296,31 +306,35 @@ enum BodyAnalysisEngine {
         chooseMaximum: Bool,
         angularCoverage: Double
     ) -> CrossSectionMeasurement? {
-        var best: CrossSectionMeasurement?
+        var candidates: [CrossSectionMeasurement?] = []
 
         for fraction in yFractions {
             let y = torsoHeight * fraction
-            guard let section = section(
+            let result = section(
                 points: points,
                 y: y,
                 halfBand: halfBand,
                 maxAbsX: maxAbsX,
                 maxAbsZ: maxAbsZ,
                 angularCoverage: angularCoverage
-            ) else { continue }
-
-            if let current = best {
-                if chooseMaximum {
-                    if section.perimeterCm > current.perimeterCm { best = section }
-                } else {
-                    if section.perimeterCm < current.perimeterCm { best = section }
-                }
-            } else {
-                best = section
-            }
+            )
+            candidates.append(result)
         }
-
-        return best
+        // An isolated low waist or high chest can be a missing/noisy slice.
+        // Require support from both neighbouring heights before taking extrema.
+        guard candidates.count >= 3 else { return nil }
+        var supported: [CrossSectionMeasurement] = []
+        for index in 1..<(candidates.count - 1) {
+            guard let a = candidates[index - 1], let b = candidates[index],
+                  let c = candidates[index + 1] else { continue }
+            let tolerance = max(2.0, b.perimeterCm * 0.03)
+            guard abs(a.perimeterCm - b.perimeterCm) <= tolerance,
+                  abs(c.perimeterCm - b.perimeterCm) <= tolerance else { continue }
+            supported.append(b)
+        }
+        return supported.sorted {
+            chooseMaximum ? $0.perimeterCm > $1.perimeterCm : $0.perimeterCm < $1.perimeterCm
+        }.first
     }
 
     private static func section(
@@ -335,12 +349,15 @@ enum BodyAnalysisEngine {
         projected.reserveCapacity(600)
 
         for point in points {
-            guard abs(point.y - y) <= halfBand else { continue }
+            guard ScanGeometry.isFinite(SIMD3<Float>(point.x, point.y, point.z)),
+                  abs(point.y - y) <= halfBand else { continue }
             guard abs(point.x) <= maxAbsX, abs(point.z) <= maxAbsZ else { continue }
             projected.append(P2(x: point.x, z: point.z))
         }
 
-        guard projected.count >= 60 else { return nil }
+        // Repeated stationary samples are not additional surface coverage.
+        projected = Array(Set(projected.map { QuantizedP2($0) })).map { $0.point }
+        guard projected.count >= 100 else { return nil }
 
         let xs = projected.map(\.x).sorted()
         let zs = projected.map(\.z).sorted()
@@ -355,9 +372,36 @@ enum BodyAnalysisEngine {
         let filtered = projected.filter {
             hypotf($0.x - medianX, $0.z - medianZ) <= upper
         }
-        guard filtered.count >= 50 else { return nil }
+        guard filtered.count >= 100 else { return nil }
 
-        let hull = convexHull(filtered)
+        // A raw convex hull follows the single furthest noisy depth pixel.
+        // Use independent angular sectors and a robust radius within each.
+        let sectorCount = 48
+        var sectors = [[P2]](repeating: [], count: sectorCount)
+        for point in filtered {
+            let angle = atan2(point.z - medianZ, point.x - medianX) + Float.pi
+            let index = min(sectorCount - 1, Int(angle / (2 * Float.pi) * Float(sectorCount)))
+            sectors[index].append(point)
+        }
+        let occupied = sectors.map { $0.count >= 2 }
+        let angularFraction = Double(occupied.filter { $0 }.count) / Double(sectorCount)
+        var run = 0
+        var longestGap = 0
+        for index in 0..<(sectorCount * 2) {
+            run = occupied[index % sectorCount] ? 0 : run + 1
+            longestGap = max(longestGap, run)
+        }
+        let gapDegrees = Double(min(sectorCount, longestGap)) * 360 / Double(sectorCount)
+        guard angularFraction >= 0.90, gapDegrees <= 30 else { return nil }
+
+        var representatives: [P2] = []
+        for sector in sectors where sector.count >= 2 {
+            let sorted = sector.sorted {
+                hypotf($0.x - medianX, $0.z - medianZ) < hypotf($1.x - medianX, $1.z - medianZ)
+            }
+            representatives.append(sorted[sorted.count / 2])
+        }
+        let hull = convexHull(representatives)
         guard hull.count >= 8 else { return nil }
 
         var perimeter: Float = 0
@@ -372,10 +416,8 @@ enum BodyAnalysisEngine {
         let minZ = hull.map(\.z).min() ?? 0
         let maxZ = hull.map(\.z).max() ?? 0
 
-        let samplingScore = min(1.0, Double(filtered.count) / 450.0)
-        let hullScore = min(1.0, Double(hull.count) / 28.0)
-        let coverageScore = min(1.0, angularCoverage / 0.80)
-        let confidence = max(0, min(1, samplingScore * 0.35 + hullScore * 0.25 + coverageScore * 0.40))
+        // Completeness score only, never a calibrated probability of accuracy.
+        let confidence = min(min(1, angularCoverage), angularFraction)
 
         return CrossSectionMeasurement(
             yCmRelativePelvis: Double(y * 100),
@@ -384,7 +426,9 @@ enum BodyAnalysisEngine {
             depthCm: Double((maxZ - minZ) * 100),
             sampleCount: filtered.count,
             hullPointCount: hull.count,
-            confidence: confidence
+            confidence: confidence,
+            angularCoverage: angularFraction,
+            largestGapDegrees: gapDegrees
         )
     }
 
