@@ -1,13 +1,27 @@
 name: Build iOS Body Scan
 
 on:
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'tests/**'
+      - '.github/workflows/ios-build.yml'
   push:
     paths:
       - 'ios/**'
+      - 'tests/**'
       - '.github/workflows/ios-build.yml'
   workflow_dispatch:
 
 jobs:
+  geometry-regression:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the actual measurement engine and run analytic fixtures
+        run: |
+          swiftc ios/BodyScan/ScanModels.swift ios/BodyScan/ScanGeometry.swift ios/BodyScan/BodyAnalysisEngine.swift tests/main.swift -o /tmp/body-scan-regression
+          /tmp/body-scan-regression
   build:
     runs-on: macos-latest
     steps:

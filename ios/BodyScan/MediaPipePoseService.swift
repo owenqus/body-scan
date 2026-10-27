@@ -4,7 +4,7 @@ import MediaPipeTasksVision
 import UIKit
 
 final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
-    var onResult: (([Point3D], Int) -> Void)?
+    var onResult: (([PoseLandmark3D], Int) -> Void)?
     var onStatus: ((String) -> Void)?
 
     private let modelURL = URL(string: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task")!
@@ -37,13 +37,13 @@ final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
                 options.minTrackingConfidence = 0.55
                 options.poseLandmarkerLiveStreamDelegate = self
                 let newLandmarker = try PoseLandmarker(options: options)
-                await MainActor.run {
+                self.workQueue.async {
                     self.landmarker = newLandmarker
                     self.isPreparing = false
                     self.onStatus?("MediaPipe ready")
                 }
             } catch {
-                await MainActor.run {
+                self.workQueue.async {
                     self.isPreparing = false
                     self.onStatus?("MediaPipe failed: \(error.localizedDescription)")
                 }
@@ -52,12 +52,10 @@ final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
     }
 
     func process(pixelBuffer: CVPixelBuffer, timestampMs: Int) {
-        guard let landmarker else { return }
-        guard timestampMs > lastTimestampMs else { return }
-        lastTimestampMs = timestampMs
-
         workQueue.async { [weak self] in
             guard let self else { return }
+            guard let landmarker = self.landmarker, timestampMs > self.lastTimestampMs else { return }
+            self.lastTimestampMs = timestampMs
             do {
                 let bgra = try self.makeBGRA(from: pixelBuffer)
                 let image = try MPImage(pixelBuffer: bgra, orientation: .right)
@@ -85,7 +83,9 @@ final class MediaPipePoseService: NSObject, PoseLandmarkerLiveStreamDelegate {
 
         guard let world = result?.worldLandmarks.first else { return }
         let points = world.map { landmark in
-            Point3D(landmark.x, landmark.y, landmark.z)
+            PoseLandmark3D(point: Point3D(landmark.x, landmark.y, landmark.z),
+                           visibility: landmark.visibility?.floatValue ?? 0,
+                           presence: landmark.presence?.floatValue ?? 0)
         }
 
         DispatchQueue.main.async {

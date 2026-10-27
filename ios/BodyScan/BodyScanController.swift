@@ -1,17 +1,16 @@
 import ARKit
 import Combine
 import Foundation
-import ImageIO
 import simd
 import UIKit
 import Vision
 
 final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
     let session = ARSession()
-
     @Published var inputHeightCm: Double = 178
     @Published private(set) var statusText = "准备中"
     @Published private(set) var isScanning = false
+    @Published private(set) var isProcessing = false
     @Published private(set) var appleJointCount = 0
     @Published private(set) var mediaPipeJointCount = 0
     @Published private(set) var mediaPipeStatus = "MediaPipe preparing"
@@ -23,70 +22,64 @@ final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
     @Published private(set) var latestMetrics = TailoringMetrics.empty
     @Published private(set) var exportURL: URL?
 
-    private struct TimedMediaPipePose {
-        var timestamp: TimeInterval
-        var points: [Point3D]
-    }
-
-    private struct BodyReference {
-        var timestamp: TimeInterval
-        var rootWorld: SIMD3<Float>
-        var yawWorld: Float
-        var shoulderHeightMeters: Float
-        var calibrationScale: Float
-    }
-
-    private let visionQueue = DispatchQueue(label: "BodyScan.Vision", qos: .userInitiated)
-    private let pointCloudQueue = DispatchQueue(label: "BodyScan.PointCloud", qos: .userInitiated)
-    private let dataLock = NSLock()
+    // All mutable scan data and AR/Vision callbacks share one serial queue.
+    // UI writes stay on main. No main-thread sync, concurrent array mutation,
+    // or post-scan preview result is allowed to overwrite the final measurements.
+    private let pipeline = DispatchQueue(label: "BodyScan.Pipeline", qos: .userInitiated)
     private let mediaPipe = MediaPipePoseService()
-
-    private var visionBusy = false
+    private var collecting = false
+    private var finished = false
+    private var heightCm: Double = 178
+    private var startedAt: Date?
     private var lastVisionTimestamp: TimeInterval = 0
-    private var lastPointCloudTimestamp: TimeInterval = 0
     private var lastMediaPipeTimestamp: TimeInterval = 0
-
-    private var scanStartedAt: Date?
+    private var latestMP: (points: [PoseLandmark3D], timestamp: TimeInterval)?
     private var poseFrames: [PoseFrameRecord] = []
-    private var pointCloud: [Point3D] = []
+    private var metricSamples: [TailoringMetrics] = []
+    private var torsoHeights: [Float] = []
+    private var shoulderWidths: [Float] = []
     private var angularBins = Set<Int>()
-    private var mediaPipeFrameCount = 0
-    private let angularBinCount = 24
-    private let maxPointCloudPoints = 140_000
+    private var referenceYaw: Float?
+    private var depthSource = "none"
+    private var acceptedDepthFrames = 0
+    private var rejectedFrames: [String: Int] = [:]
+    private var totalFrames = 0
+    private var mpFrames = 0
+    private var workingMetrics = TailoringMetrics.empty
+    private var pendingSkeleton: (timestamp: TimeInterval, joints: [String: SIMD3<Float>],
+                                  sampleIndex: Int, recordIndex: Int)?
+    // Equal budgets by angle prevent the first front view using all memory.
+    private var anglePoints = [[Point3D]](repeating: [], count: ScanGeometry.yawBinCount)
+    private var angleVoxels = [Set<Voxel>](repeating: [], count: ScanGeometry.yawBinCount)
+    private let maxPointsPerAngle = 5_000
 
-    private var latestMediaPipePose: TimedMediaPipePose?
-    private var latestBodyReference: BodyReference?
-    private var scanReferenceYaw: Float?
-    private var visionHeightSamplesMeters: [Float] = []
-    private var torsoHeightSamplesMeters: [Float] = []
-    private var shoulderWidthSamplesMeters: [Float] = []
-
-    private var latestChestSection: CrossSectionMeasurement?
-    private var latestWaistSection: CrossSectionMeasurement?
-    private var latestHipSection: CrossSectionMeasurement?
+    private struct Voxel: Hashable {
+        let x: Int
+        let y: Int
+        let z: Int
+        init(_ p: SIMD3<Float>) {
+            x = Int((p.x / 0.005).rounded())
+            y = Int((p.y / 0.005).rounded())
+            z = Int((p.z / 0.005).rounded())
+        }
+    }
 
     override init() {
         super.init()
+        session.delegateQueue = pipeline
         session.delegate = self
-
         mediaPipe.onStatus = { [weak self] text in
-            self?.mediaPipeStatus = text
+            DispatchQueue.main.async { self?.mediaPipeStatus = text }
         }
-
         mediaPipe.onResult = { [weak self] points, timestampMs in
             guard let self else { return }
-            let timestamp = TimeInterval(timestampMs) / 1000.0
-
-            self.dataLock.lock()
-            self.latestMediaPipePose = TimedMediaPipePose(
-                timestamp: timestamp,
-                points: points
-            )
-            self.dataLock.unlock()
-
-            self.mediaPipeJointCount = points.count
-            if self.isScanning {
-                self.mediaPipeFrameCount += 1
+            self.pipeline.async {
+                self.latestMP = (points, TimeInterval(timestampMs) / 1000)
+                if self.collecting {
+                    self.mpFrames += 1
+                    self.applyMediaPipe(points, timestamp: TimeInterval(timestampMs) / 1000)
+                }
+                DispatchQueue.main.async { self.mediaPipeJointCount = points.count }
             }
         }
     }
@@ -96,661 +89,380 @@ final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
             statusText = "此 iPhone 不支持 ARWorldTracking"
             return
         }
-
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.isAutoFocusEnabled = true
-
-        var semantics: ARConfiguration.FrameSemantics = []
-
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.bodyDetection) {
-            semantics.insert(.bodyDetection)
-        }
-
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentationWithDepth) {
-            semantics.insert(.personSegmentationWithDepth)
+            config.frameSemantics.insert(.personSegmentationWithDepth)
         } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.personSegmentation) {
-            semantics.insert(.personSegmentation)
+            config.frameSemantics.insert(.personSegmentation)
         }
-
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            semantics.insert(.sceneDepth)
+            config.frameSemantics.insert(.sceneDepth)
         }
-
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-            semantics.insert(.smoothedSceneDepth)
-        }
-
-        config.frameSemantics = semantics
+        // Temporal smoothing can trail a rotating body; prefer current raw depth.
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         statusText = "摄像头已启动"
     }
 
     func beginScan() {
-        guard !isScanning else { return }
-
-        visionQueue.sync {}
-        pointCloudQueue.sync {}
-
-        poseFrames.removeAll(keepingCapacity: true)
-        pointCloud.removeAll(keepingCapacity: true)
-        angularBins.removeAll(keepingCapacity: true)
-        visionHeightSamplesMeters.removeAll(keepingCapacity: true)
-        torsoHeightSamplesMeters.removeAll(keepingCapacity: true)
-        shoulderWidthSamplesMeters.removeAll(keepingCapacity: true)
-
-        dataLock.lock()
-        scanReferenceYaw = nil
-        latestBodyReference = nil
-        dataLock.unlock()
-
-        mediaPipeFrameCount = 0
-        pointCloudCount = 0
-        scanFrameCount = 0
-        angularCoverage = 0
-        latestMetrics = .empty
-        latestChestSection = nil
-        latestWaistSection = nil
-        latestHipSection = nil
-        exportURL = nil
-        scanStartedAt = Date()
-        isScanning = true
-        statusText = "请缓慢转一圈"
+        guard !isScanning, !isProcessing else { return }
+        guard inputHeightCm.isFinite, (120...230).contains(inputHeightCm) else {
+            statusText = "请输入 120–230 cm 的真实身高"
+            return
+        }
+        let input = inputHeightCm
+        isProcessing = true
+        pipeline.async {
+            self.clearScan()
+            self.heightCm = input
+            self.startedAt = Date()
+            self.collecting = true
+            DispatchQueue.main.async {
+                self.clearDisplay()
+                self.isProcessing = false
+                self.isScanning = true
+                self.statusText = "请保持站直，缓慢转一圈"
+            }
+        }
     }
 
     func finishScan() {
-        guard isScanning else { return }
-        isScanning = false
-        statusText = "扫描结束，正在计算身体截面"
-
-        visionQueue.sync {}
-        pointCloudQueue.sync {}
-
-        let heightMedian = median(visionHeightSamplesMeters)
-        let calibrationScale: Float = {
-            guard let heightMedian, heightMedian > 0.8 else { return 1 }
-            return Float(inputHeightCm / 100.0) / heightMedian
-        }()
-
-        let scaledPointCloud = pointCloud.map {
-            Point3D(
-                $0.x * calibrationScale,
-                $0.y * calibrationScale,
-                $0.z * calibrationScale
-            )
-        }
-
-        let torsoHeight = Double((median(torsoHeightSamplesMeters) ?? 0.55) * calibrationScale)
-        let shoulderWidth = Double((median(shoulderWidthSamplesMeters) ?? 0.43) * calibrationScale)
-
-        let sections = BodyAnalysisEngine.analyzeCrossSections(
-            canonicalPoints: scaledPointCloud,
-            torsoHeightMeters: torsoHeight,
-            shoulderWidthMeters: shoulderWidth,
-            angularCoverage: angularCoverage
-        )
-
-        latestChestSection = sections.chest
-        latestWaistSection = sections.waist
-        latestHipSection = sections.hip
-        pointCloud = scaledPointCloud
-        pointCloudCount = scaledPointCloud.count
-
-        var metrics = latestMetrics
-        metrics.chestCircumferenceCm = sections.chest?.perimeterCm
-        metrics.waistCircumferenceCm = sections.waist?.perimeterCm
-        metrics.hipCircumferenceCm = sections.hip?.perimeterCm
-        metrics.chestWidthCm = sections.chest?.widthCm
-        metrics.chestDepthCm = sections.chest?.depthCm
-        metrics.waistWidthCm = sections.waist?.widthCm
-        metrics.waistDepthCm = sections.waist?.depthCm
-        metrics.hipWidthCm = sections.hip?.widthCm
-        metrics.hipDepthCm = sections.hip?.depthCm
-
-        let confidences = [
-            sections.chest?.confidence,
-            sections.waist?.confidence,
-            sections.hip?.confidence
-        ].compactMap { $0 }
-        if !confidences.isEmpty {
-            metrics.sectionConfidence = confidences.reduce(0, +) / Double(confidences.count)
-        }
-
-        latestMetrics = metrics
-        exportURL = makeExportFile()
-
-        if sections.chest == nil || sections.waist == nil || sections.hip == nil {
-            statusText = "扫描完成，但部分截面数据不足"
-        } else {
-            statusText = "扫描完成：已生成胸/腰/臀截面"
+        guard isScanning, !isProcessing else { return }
+        isProcessing = true
+        statusText = "正在检查扫描质量与身体截面"
+        pipeline.async {
+            self.collecting = false
+            self.finished = true
+            self.finalizeScan()
         }
     }
 
     func resetScan() {
-        isScanning = false
-        visionQueue.sync {}
-        pointCloudQueue.sync {}
+        guard !isProcessing else { return }
+        isProcessing = true
+        pipeline.async {
+            self.clearScan()
+            DispatchQueue.main.async {
+                self.clearDisplay()
+                self.isProcessing = false
+                self.isScanning = false
+                self.statusText = "已重置"
+            }
+        }
+    }
 
-        poseFrames.removeAll()
-        pointCloud.removeAll()
-        angularBins.removeAll()
-        visionHeightSamplesMeters.removeAll()
-        torsoHeightSamplesMeters.removeAll()
-        shoulderWidthSamplesMeters.removeAll()
+    private func clearScan() {
+        collecting = false; finished = false; startedAt = nil
+        poseFrames = []; metricSamples = []; torsoHeights = []; shoulderWidths = []
+        angularBins = []; referenceYaw = nil; depthSource = "none"
+        rejectedFrames = [:]; acceptedDepthFrames = 0; totalFrames = 0; mpFrames = 0
+        latestMP = nil; pendingSkeleton = nil; workingMetrics = .empty
+        anglePoints = [[Point3D]](repeating: [], count: ScanGeometry.yawBinCount)
+        angleVoxels = [Set<Voxel>](repeating: [], count: ScanGeometry.yawBinCount)
+    }
 
-        dataLock.lock()
-        scanReferenceYaw = nil
-        latestBodyReference = nil
-        dataLock.unlock()
-
-        mediaPipeFrameCount = 0
-        pointCloudCount = 0
-        scanFrameCount = 0
-        angularCoverage = 0
-        latestMetrics = .empty
-        latestChestSection = nil
-        latestWaistSection = nil
-        latestHipSection = nil
-        exportURL = nil
-        statusText = "已重置"
+    private func clearDisplay() {
+        pointCloudCount = 0; scanFrameCount = 0; angularCoverage = 0
+        latestMetrics = .empty; exportURL = nil
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        let personDepth = frame.estimatedDepthData != nil && frame.segmentationBuffer != nil
-        let lidarDepth = frame.sceneDepth != nil || frame.smoothedSceneDepth != nil
-
+        let person = frame.estimatedDepthData != nil && frame.segmentationBuffer != nil
+        let lidar = frame.sceneDepth != nil
         DispatchQueue.main.async {
-            self.personDepthAvailable = personDepth
-            self.lidarSceneDepthAvailable = lidarDepth
-            if self.isScanning {
-                self.scanFrameCount += 1
-            }
+            self.personDepthAvailable = person
+            self.lidarSceneDepthAvailable = lidar
         }
-
-        if frame.timestamp - lastVisionTimestamp >= 0.18 {
-            lastVisionTimestamp = frame.timestamp
-            analyzeAppleVision(frame)
-        }
-
-        if frame.timestamp - lastMediaPipeTimestamp >= 0.25 {
+        guard !finished else { return }
+        if collecting { totalFrames += 1 }
+        if frame.timestamp - lastMediaPipeTimestamp >= 0.18 {
             lastMediaPipeTimestamp = frame.timestamp
-            mediaPipe.process(
-                pixelBuffer: frame.capturedImage,
-                timestampMs: Int(frame.timestamp * 1000)
-            )
+            mediaPipe.process(pixelBuffer: frame.capturedImage, timestampMs: Int(frame.timestamp * 1000))
         }
-
-        if isScanning, frame.timestamp - lastPointCloudTimestamp >= 0.28 {
-            lastPointCloudTimestamp = frame.timestamp
-            accumulatePersonPointCloud(frame)
-        }
-    }
-
-    private func analyzeAppleVision(_ frame: ARFrame) {
-        guard !visionBusy else { return }
-        visionBusy = true
-
-        let pixelBuffer = frame.capturedImage
-        let timestamp = frame.timestamp
-        let enteredHeight = inputHeightCm
-        let cameraTransform = frame.camera.transform
-
-        visionQueue.async { [weak self] in
-            guard let self else { return }
-            defer { self.visionBusy = false }
-
-            do {
-                let request = VNDetectHumanBodyPose3DRequest()
-                let handler = VNImageRequestHandler(
-                    cvPixelBuffer: pixelBuffer,
-                    orientation: .right,
-                    options: [:]
-                )
-                try handler.perform([request])
-
-                guard let observation = request.results?.first else {
-                    DispatchQueue.main.async {
-                        self.appleJointCount = 0
-                    }
-                    return
-                }
-
-                let rawApple = self.canonicalAppleJoints(observation)
-                let observedHeightMeters = observation.bodyHeight
-                let calibrationScale: Float = observedHeightMeters > 0.8
-                    ? Float(enteredHeight / 100.0) / observedHeightMeters
-                    : 1
-
-                let calibratedApple = self.calibrateAppleJoints(
-                    rawApple,
-                    scale: calibrationScale
-                )
-
-                let mediaPipeSnapshot: TimedMediaPipePose? = {
-                    self.dataLock.lock()
-                    defer { self.dataLock.unlock() }
-                    guard
-                        let value = self.latestMediaPipePose,
-                        abs(value.timestamp - timestamp) < 0.50
-                    else { return nil }
-                    return value
-                }()
-
-                let fusedResult: FusedSkeletonResult = {
-                    if let mediaPipeSnapshot,
-                       let fused = BodyAnalysisEngine.fuseSkeletons(
-                            apple: rawApple,
-                            mediaPipe: mediaPipeSnapshot.points,
-                            appleCalibrationScale: calibrationScale
-                       ) {
-                        return fused
-                    }
-                    return FusedSkeletonResult(
-                        joints: calibratedApple,
-                        agreementCm: nil
-                    )
-                }()
-
-                let metrics = BodyAnalysisEngine.metrics(
-                    fused: fusedResult,
-                    visionBodyHeightCm: observedHeightMeters > 0
-                        ? Double(observedHeightMeters * 100)
-                        : nil
-                )
-
-                let reference = self.makeBodyReference(
-                    observation: observation,
-                    cameraTransform: cameraTransform,
-                    timestamp: timestamp,
-                    calibrationScale: calibrationScale
-                )
-
-                if let reference {
-                    self.dataLock.lock()
-                    self.latestBodyReference = reference
-                    if self.isScanning && self.scanReferenceYaw == nil {
-                        self.scanReferenceYaw = reference.yawWorld
-                    }
-                    let referenceYaw = self.scanReferenceYaw
-                    self.dataLock.unlock()
-
-                    if self.isScanning, let referenceYaw {
-                        let relativeDegrees = Double(
-                            self.normalizedPositiveAngle(reference.yawWorld - referenceYaw)
-                        ) * 180 / .pi
-                        self.angularBins.insert(self.yawBin(relativeDegrees))
-                    }
-
-                    if self.isScanning {
-                        self.torsoHeightSamplesMeters.append(reference.shoulderHeightMeters)
-                    }
-                }
-
-                if self.isScanning {
-                    if observedHeightMeters > 0.8 {
-                        self.visionHeightSamplesMeters.append(observedHeightMeters)
-                    }
-
-                    if let l = rawApple["leftShoulder"],
-                       let r = rawApple["rightShoulder"] {
-                        self.shoulderWidthSamplesMeters.append(simd_distance(l, r))
-                    }
-
-                    let record = PoseFrameRecord(
-                        timestamp: timestamp,
-                        appleJoints: calibratedApple.mapValues { Point3D($0.x, $0.y, $0.z) },
-                        mediaPipeWorldJoints: mediaPipeSnapshot?.points ?? [],
-                        fusedJoints: fusedResult.joints.mapValues { Point3D($0.x, $0.y, $0.z) },
-                        bodyYawDegrees: reference.map { Double($0.yawWorld) * 180 / .pi },
-                        bodyHeightEstimateMeters: observedHeightMeters,
-                        skeletonAgreementCm: fusedResult.agreementCm
-                    )
-                    self.poseFrames.append(record)
-                }
-
-                let coverage = Double(self.angularBins.count) / Double(self.angularBinCount)
-
-                DispatchQueue.main.async {
-                    self.appleJointCount = rawApple.count
-                    var mergedMetrics = metrics
-                    mergedMetrics.chestCircumferenceCm = self.latestMetrics.chestCircumferenceCm
-                    mergedMetrics.waistCircumferenceCm = self.latestMetrics.waistCircumferenceCm
-                    mergedMetrics.hipCircumferenceCm = self.latestMetrics.hipCircumferenceCm
-                    mergedMetrics.chestWidthCm = self.latestMetrics.chestWidthCm
-                    mergedMetrics.chestDepthCm = self.latestMetrics.chestDepthCm
-                    mergedMetrics.waistWidthCm = self.latestMetrics.waistWidthCm
-                    mergedMetrics.waistDepthCm = self.latestMetrics.waistDepthCm
-                    mergedMetrics.hipWidthCm = self.latestMetrics.hipWidthCm
-                    mergedMetrics.hipDepthCm = self.latestMetrics.hipDepthCm
-                    mergedMetrics.sectionConfidence = self.latestMetrics.sectionConfidence
-                    self.latestMetrics = mergedMetrics
-                    self.angularCoverage = min(1, coverage)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.statusText = "Apple 3D Pose error: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    private func canonicalAppleJoints(
-        _ observation: VNHumanBodyPose3DObservation
-    ) -> [String: SIMD3<Float>] {
-        let definitions: [(String, VNHumanBodyPose3DObservation.JointName)] = [
-            ("root", .root),
-            ("centerShoulder", .centerShoulder),
-            ("leftShoulder", .leftShoulder),
-            ("rightShoulder", .rightShoulder),
-            ("leftElbow", .leftElbow),
-            ("rightElbow", .rightElbow),
-            ("leftWrist", .leftWrist),
-            ("rightWrist", .rightWrist),
-            ("leftHip", .leftHip),
-            ("rightHip", .rightHip),
-            ("leftKnee", .leftKnee),
-            ("rightKnee", .rightKnee),
-            ("leftAnkle", .leftAnkle),
-            ("rightAnkle", .rightAnkle)
-        ]
-
-        var result: [String: SIMD3<Float>] = [:]
-        for (name, joint) in definitions {
-            if let point = cameraPosition(joint, observation) {
-                result[name] = point
-            }
-        }
-        return result
-    }
-
-    private func calibrateAppleJoints(
-        _ joints: [String: SIMD3<Float>],
-        scale: Float
-    ) -> [String: SIMD3<Float>] {
-        guard
-            let leftHip = joints["leftHip"],
-            let rightHip = joints["rightHip"]
-        else {
-            return joints.mapValues { $0 * scale }
-        }
-
-        let pelvis = (leftHip + rightHip) * 0.5
-        return joints.mapValues { pelvis + ($0 - pelvis) * scale }
-    }
-
-    private func makeBodyReference(
-        observation: VNHumanBodyPose3DObservation,
-        cameraTransform: simd_float4x4,
-        timestamp: TimeInterval,
-        calibrationScale: Float
-    ) -> BodyReference? {
-        guard
-            let rootCamera = cameraPosition(.root, observation),
-            let centerShoulderCamera = cameraPosition(.centerShoulder, observation),
-            let leftShoulder = cameraPosition(.leftShoulder, observation),
-            let rightShoulder = cameraPosition(.rightShoulder, observation)
-        else { return nil }
-
-        let shoulderAxis = simd_normalize(rightShoulder - leftShoulder)
-        let upAxis = simd_normalize(centerShoulderCamera - rootCamera)
-        var forwardCamera = simd_cross(shoulderAxis, upAxis)
-        if simd_length(forwardCamera) < 0.01 { return nil }
-        forwardCamera = simd_normalize(forwardCamera)
-
-        let root4 = cameraTransform * SIMD4<Float>(
-            rootCamera.x,
-            rootCamera.y,
-            rootCamera.z,
-            1
-        )
-        let shoulder4 = cameraTransform * SIMD4<Float>(
-            centerShoulderCamera.x,
-            centerShoulderCamera.y,
-            centerShoulderCamera.z,
-            1
-        )
-        let forward4 = cameraTransform * SIMD4<Float>(
-            forwardCamera.x,
-            forwardCamera.y,
-            forwardCamera.z,
-            0
-        )
-
-        let rootWorld = SIMD3<Float>(root4.x, root4.y, root4.z)
-        let shoulderWorld = SIMD3<Float>(shoulder4.x, shoulder4.y, shoulder4.z)
-        let forwardWorld = simd_normalize(
-            SIMD3<Float>(forward4.x, forward4.y, forward4.z)
-        )
-
-        let yaw = atan2(forwardWorld.x, -forwardWorld.z)
-        let torsoHeight = abs(shoulderWorld.y - rootWorld.y)
-
-        return BodyReference(
-            timestamp: timestamp,
-            rootWorld: rootWorld,
-            yawWorld: yaw,
-            shoulderHeightMeters: torsoHeight,
-            calibrationScale: calibrationScale
-        )
-    }
-
-    private func cameraPosition(
-        _ joint: VNHumanBodyPose3DObservation.JointName,
-        _ observation: VNHumanBodyPose3DObservation
-    ) -> SIMD3<Float>? {
-        guard let matrix = try? observation.cameraRelativePosition(joint) else {
-            return nil
-        }
-        let t = matrix.columns.3
-        return SIMD3<Float>(t.x, t.y, t.z)
-    }
-
-    private func normalizedPositiveAngle(_ angle: Float) -> Float {
-        var value = angle.truncatingRemainder(dividingBy: 2 * .pi)
-        if value < 0 { value += 2 * .pi }
-        return value
-    }
-
-    private func yawBin(_ degrees: Double) -> Int {
-        let normalized = degrees.truncatingRemainder(dividingBy: 360)
-        let width = 360.0 / Double(angularBinCount)
-        return max(0, min(angularBinCount - 1, Int(normalized / width)))
-    }
-
-    private func accumulatePersonPointCloud(_ frame: ARFrame) {
-        guard pointCloud.count < maxPointCloudPoints else { return }
-        guard let segmentation = frame.segmentationBuffer else { return }
-
-        let depthBuffer: CVPixelBuffer?
-        if let personDepth = frame.estimatedDepthData {
-            depthBuffer = personDepth
-        } else if let lidar = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap {
-            depthBuffer = lidar
-        } else {
+        guard frame.timestamp - lastVisionTimestamp >= 0.18 else { return }
+        lastVisionTimestamp = frame.timestamp
+        guard case .normal = frame.camera.trackingState else {
+            reject("tracking_not_normal")
             return
         }
-
-        guard let depthBuffer else { return }
-
-        let bodyReference: BodyReference? = {
-            dataLock.lock()
-            defer { dataLock.unlock() }
-            guard
-                let reference = latestBodyReference,
-                abs(reference.timestamp - frame.timestamp) < 0.55
-            else { return nil }
-            return reference
-        }()
-
-        guard let bodyReference else { return }
-
-        let referenceYaw: Float? = {
-            dataLock.lock()
-            defer { dataLock.unlock() }
-            if scanReferenceYaw == nil {
-                scanReferenceYaw = bodyReference.yawWorld
-            }
-            return scanReferenceYaw
-        }()
-
-        guard let referenceYaw else { return }
-
-        let deltaYaw = bodyReference.yawWorld - referenceYaw
-        let cameraTransform = frame.camera.transform
-        var intrinsics = frame.camera.intrinsics
-        let capturedWidth = Float(CVPixelBufferGetWidth(frame.capturedImage))
-        let capturedHeight = Float(CVPixelBufferGetHeight(frame.capturedImage))
-
-        pointCloudQueue.async { [weak self] in
-            guard let self else { return }
-
-            let depthWidth = CVPixelBufferGetWidth(depthBuffer)
-            let depthHeight = CVPixelBufferGetHeight(depthBuffer)
-            guard depthWidth > 0, depthHeight > 0 else { return }
-
-            let scaleX = Float(depthWidth) / capturedWidth
-            let scaleY = Float(depthHeight) / capturedHeight
-            intrinsics.columns.0.x *= scaleX
-            intrinsics.columns.1.y *= scaleY
-            intrinsics.columns.2.x *= scaleX
-            intrinsics.columns.2.y *= scaleY
-
-            guard CVPixelBufferGetPixelFormatType(depthBuffer) == kCVPixelFormatType_DepthFloat32 else {
-                return
-            }
-
-            CVPixelBufferLockBaseAddress(depthBuffer, .readOnly)
-            CVPixelBufferLockBaseAddress(segmentation, .readOnly)
-
-            defer {
-                CVPixelBufferUnlockBaseAddress(segmentation, .readOnly)
-                CVPixelBufferUnlockBaseAddress(depthBuffer, .readOnly)
-            }
-
-            guard
-                let depthBase = CVPixelBufferGetBaseAddress(depthBuffer),
-                let rawMask = CVPixelBufferGetBaseAddress(segmentation)
-            else { return }
-
-            let depthRowFloats = CVPixelBufferGetBytesPerRow(depthBuffer) / MemoryLayout<Float32>.size
-            let depth = depthBase.assumingMemoryBound(to: Float32.self)
-
-            let maskBase = rawMask.assumingMemoryBound(to: UInt8.self)
-            let maskWidth = CVPixelBufferGetWidth(segmentation)
-            let maskHeight = CVPixelBufferGetHeight(segmentation)
-            let maskRowBytes = CVPixelBufferGetBytesPerRow(segmentation)
-
-            let fx = intrinsics.columns.0.x
-            let fy = intrinsics.columns.1.y
-            let cx = intrinsics.columns.2.x
-            let cy = intrinsics.columns.2.y
-            let sampleStep = 5
-
-            let c = cos(-deltaYaw)
-            let s = sin(-deltaYaw)
-
-            var newPoints: [Point3D] = []
-            newPoints.reserveCapacity((depthWidth / sampleStep) * (depthHeight / sampleStep) / 3)
-
-            for y in stride(from: 0, to: depthHeight, by: sampleStep) {
-                for x in stride(from: 0, to: depthWidth, by: sampleStep) {
-                    let mx = min(maskWidth - 1, x * maskWidth / depthWidth)
-                    let my = min(maskHeight - 1, y * maskHeight / depthHeight)
-                    let maskValue = maskBase[my * maskRowBytes + mx]
-                    if maskValue < 128 { continue }
-
-                    let z = depth[y * depthRowFloats + x]
-                    if !z.isFinite || z < 0.5 || z > 5.0 { continue }
-
-                    let cameraX = (Float(x) - cx) / fx * z
-                    let cameraY = -(Float(y) - cy) / fy * z
-                    let cameraPoint = SIMD4<Float>(cameraX, cameraY, -z, 1)
-                    let worldPoint4 = cameraTransform * cameraPoint
-                    let worldPoint = SIMD3<Float>(
-                        worldPoint4.x,
-                        worldPoint4.y,
-                        worldPoint4.z
-                    )
-
-                    let rel = worldPoint - bodyReference.rootWorld
-                    let canonicalX = c * rel.x + s * rel.z
-                    let canonicalZ = -s * rel.x + c * rel.z
-
-                    if abs(canonicalX) > 0.80 || abs(rel.y) > 1.40 || abs(canonicalZ) > 0.70 {
-                        continue
-                    }
-
-                    newPoints.append(Point3D(
-                        canonicalX,
-                        rel.y,
-                        canonicalZ
-                    ))
-
-                    if self.pointCloud.count + newPoints.count >= self.maxPointCloudPoints {
-                        break
-                    }
-                }
-
-                if self.pointCloud.count + newPoints.count >= self.maxPointCloudPoints {
-                    break
-                }
-            }
-
-            self.pointCloud.append(contentsOf: newPoints)
-
-            DispatchQueue.main.async {
-                self.pointCloudCount = self.pointCloud.count
-            }
-        }
+        analyze(frame)
     }
 
-    private func makeExportFile() -> URL? {
-        let duration = scanStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+    private func reject(_ reason: String) {
+        if collecting { rejectedFrames[reason, default: 0] += 1 }
+    }
 
-        let export = ScanExport(
-            version: "0.3-native-ios-body-analysis",
-            createdAt: Date(),
-            inputHeightCm: inputHeightCm,
-            durationSeconds: duration,
-            capturedFrameCount: scanFrameCount,
-            applePoseFrameCount: poseFrames.count,
-            mediaPipeFrameCount: mediaPipeFrameCount,
-            angularCoveragePercent: angularCoverage * 100,
-            pointCloudPointCount: pointCloud.count,
-            personDepthAvailable: personDepthAvailable,
-            lidarSceneDepthAvailable: lidarSceneDepthAvailable,
-            latestMetrics: latestMetrics,
-            chestSection: latestChestSection,
-            waistSection: latestWaistSection,
-            hipSection: latestHipSection,
-            poseFrames: poseFrames,
-            pointCloud: pointCloud
-        )
+    private func analyze(_ frame: ARFrame) {
+        do {
+            let request = VNDetectHumanBodyPose3DRequest()
+            try VNImageRequestHandler(cvPixelBuffer: frame.capturedImage,
+                                      orientation: .right, options: [:]).perform([request])
+            guard let observation = request.results?.first,
+                  let scale = ScanGeometry.skeletonScale(inputHeightCm: heightCm,
+                                                         visionHeightMeters: observation.bodyHeight) else {
+                reject("no_valid_pose")
+                return
+            }
+            let cameraJoints = projectedCameraJoints(observation, frame: frame, scale: scale)
+            guard cameraJoints.count >= 12 else { reject("joints_out_of_frame"); return }
+            let worldJoints = cameraJoints.mapValues { point -> SIMD3<Float> in
+                let p = frame.camera.transform * SIMD4<Float>(point.x, point.y, point.z, 1)
+                return SIMD3<Float>(p.x, p.y, p.z)
+            }
+            guard let body = ScanGeometry.bodyFrame(joints: worldJoints) else {
+                reject("invalid_or_leaning_pose")
+                return
+            }
+            let mp = latestMP.flatMap { value -> [Point3D]? in
+                guard ScanGeometry.synchronized(value.timestamp, frame.timestamp), value.points.count == 33,
+                      [11,12,13,14,15,16,23,24,25,26,27,28].allSatisfy({
+                          value.points[$0].visibility >= 0.7 && value.points[$0].presence >= 0.7
+                      }) else { return nil }
+                return value.points.map { $0.point }
+            }
+            let fused = mp.flatMap {
+                BodyAnalysisEngine.fuseSkeletons(apple: worldJoints, mediaPipe: $0, appleCalibrationScale: 1)
+            } ?? FusedSkeletonResult(joints: worldJoints, agreementCm: nil)
+            let measured = observation.heightEstimation == .measured
+            let metrics = BodyAnalysisEngine.metrics(fused: fused,
+                visionBodyHeightCm: measured ? Double(observation.bodyHeight * 100) : nil)
+            workingMetrics = metrics
+            if collecting {
+                metricSamples.append(metrics)
+                torsoHeights.append(body.torsoHeight)
+                if let ls = worldJoints["leftShoulder"], let rs = worldJoints["rightShoulder"] {
+                    shoulderWidths.append(simd_distance(ls, rs))
+                }
+                let transform = (0..<4).flatMap { column in
+                    (0..<4).map { row in frame.camera.transform[column][row] }
+                }
+                let intrinsics = (0..<3).flatMap { column in
+                    (0..<3).map { row in frame.camera.intrinsics[column][row] }
+                }
+                poseFrames.append(PoseFrameRecord(timestamp: frame.timestamp,
+                    appleJoints: worldJoints.mapValues { Point3D($0.x, $0.y, $0.z) },
+                    mediaPipeWorldJoints: mp ?? [],
+                    fusedJoints: fused.joints.mapValues { Point3D($0.x, $0.y, $0.z) },
+                    bodyYawDegrees: Double(body.yaw) * 180 / .pi,
+                    bodyHeightEstimateMeters: observation.bodyHeight,
+                    skeletonAgreementCm: fused.agreementCm, heightIsMeasured: measured,
+                    skeletonScale: scale, cameraTransform: transform, cameraIntrinsics: intrinsics))
+                pendingSkeleton = (frame.timestamp, worldJoints, metricSamples.count - 1, poseFrames.count - 1)
+                // Pose, segmentation, intrinsics and depth from the SAME ARFrame.
+                sampleDepth(frame, body: body)
+            }
+            let count = anglePoints.reduce(0) { $0 + $1.count }
+            let coverage = Double(angularBins.count) / Double(ScanGeometry.yawBinCount)
+            let frames = totalFrames
+            DispatchQueue.main.async {
+                self.appleJointCount = cameraJoints.count
+                self.latestMetrics = metrics
+                self.pointCloudCount = count
+                self.angularCoverage = coverage
+                self.scanFrameCount = frames
+            }
+        } catch { reject("vision_error") }
+    }
 
+    private func projectedCameraJoints(_ observation: VNHumanBodyPose3DObservation,
+                                       frame: ARFrame, scale: Float) -> [String: SIMD3<Float>] {
+        let names: [(String, VNHumanBodyPose3DObservation.JointName)] = [
+            ("root", .root), ("centerShoulder", .centerShoulder),
+            ("leftShoulder", .leftShoulder), ("rightShoulder", .rightShoulder),
+            ("leftElbow", .leftElbow), ("rightElbow", .rightElbow),
+            ("leftWrist", .leftWrist), ("rightWrist", .rightWrist),
+            ("leftHip", .leftHip), ("rightHip", .rightHip),
+            ("leftKnee", .leftKnee), ("rightKnee", .rightKnee),
+            ("leftAnkle", .leftAnkle), ("rightAnkle", .rightAnkle)
+        ]
+        let k = frame.camera.intrinsics
+        let size = frame.camera.imageResolution
+        var joints: [String: SIMD3<Float>] = [:]
+        for (name, joint) in names {
+            guard let position = try? observation.cameraRelativePosition(joint),
+                  let image = try? observation.pointInImage(joint),
+                  let raw = ScanGeometry.rawImagePoint(portraitPoint: SIMD2<Float>(Float(image.x), Float(image.y))),
+                  let camera = ScanGeometry.unproject(
+                    pixel: SIMD2<Float>(raw.x * Float(size.width), raw.y * Float(size.height)),
+                    depth: abs(position.columns.3.z) * scale,
+                    fx: k.columns.0.x, fy: k.columns.1.y, cx: k.columns.2.x, cy: k.columns.2.y) else { continue }
+            joints[name] = camera
+        }
+        return joints
+    }
+
+    // MediaPipe is asynchronous. Fuse its matching Apple frame after it arrives;
+    // otherwise the serial Vision stage would always consume the previous pose.
+    private func applyMediaPipe(_ landmarks: [PoseLandmark3D], timestamp: TimeInterval) {
+        guard let pending = pendingSkeleton,
+              ScanGeometry.synchronized(timestamp, pending.timestamp), landmarks.count == 33,
+              [11,12,13,14,15,16,23,24,25,26,27,28].allSatisfy({
+                  landmarks[$0].visibility >= 0.7 && landmarks[$0].presence >= 0.7
+              }), let fused = BodyAnalysisEngine.fuseSkeletons(apple: pending.joints,
+                  mediaPipe: landmarks.map(\.point), appleCalibrationScale: 1) else { return }
+        let metrics = BodyAnalysisEngine.metrics(fused: fused,
+            visionBodyHeightCm: metricSamples[pending.sampleIndex].visionBodyHeightCm)
+        metricSamples[pending.sampleIndex] = metrics
+        poseFrames[pending.recordIndex].mediaPipeWorldJoints = landmarks.map(\.point)
+        poseFrames[pending.recordIndex].fusedJoints = fused.joints.mapValues { Point3D($0.x, $0.y, $0.z) }
+        poseFrames[pending.recordIndex].skeletonAgreementCm = fused.agreementCm
+        workingMetrics = metrics
+        DispatchQueue.main.async { self.latestMetrics = metrics }
+    }
+
+    private func sampleDepth(_ frame: ARFrame, body: ScanGeometry.BodyFrame) {
+        guard let mask = frame.segmentationBuffer else { reject("no_segmentation"); return }
+        let source: String
+        let depth: CVPixelBuffer
+        let confidence: CVPixelBuffer?
+        if let lidar = frame.sceneDepth {
+            source = "lidar_scene_depth"; depth = lidar.depthMap; confidence = lidar.confidenceMap
+            guard confidence != nil else { reject("no_lidar_confidence"); return }
+        } else if let inferred = frame.estimatedDepthData {
+            source = "inferred_person_depth"; depth = inferred; confidence = nil
+        } else { reject("no_depth"); return }
+        guard depthSource == "none" || depthSource == source else { reject("depth_source_changed"); return }
+        guard CVPixelBufferGetPixelFormatType(depth) == kCVPixelFormatType_DepthFloat32,
+              CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent8 else {
+            reject("unsupported_depth_or_mask_format"); return
+        }
+        let w = CVPixelBufferGetWidth(depth), h = CVPixelBufferGetHeight(depth)
+        let mw = CVPixelBufferGetWidth(mask), mh = CVPixelBufferGetHeight(mask)
+        let imageSize = frame.camera.imageResolution
+        guard w > 2, h > 2, mw > 4, mh > 4,
+              abs(Double(w) / Double(h) - imageSize.width / imageSize.height) < 0.02 else {
+            reject("depth_registration_mismatch"); return
+        }
+        CVPixelBufferLockBaseAddress(depth, .readOnly)
+        CVPixelBufferLockBaseAddress(mask, .readOnly)
+        if let confidence { CVPixelBufferLockBaseAddress(confidence, .readOnly) }
+        defer {
+            if let confidence { CVPixelBufferUnlockBaseAddress(confidence, .readOnly) }
+            CVPixelBufferUnlockBaseAddress(mask, .readOnly)
+            CVPixelBufferUnlockBaseAddress(depth, .readOnly)
+        }
+        guard let db = CVPixelBufferGetBaseAddress(depth), let mb = CVPixelBufferGetBaseAddress(mask) else {
+            reject("empty_depth_buffer"); return
+        }
+        let depths = db.assumingMemoryBound(to: Float32.self)
+        let masks = mb.assumingMemoryBound(to: UInt8.self)
+        let ds = CVPixelBufferGetBytesPerRow(depth) / MemoryLayout<Float32>.size
+        let ms = CVPixelBufferGetBytesPerRow(mask)
+        let conf = confidence.flatMap { CVPixelBufferGetBaseAddress($0)?.assumingMemoryBound(to: UInt8.self) }
+        let cw = confidence.map { CVPixelBufferGetWidth($0) } ?? 0
+        let ch = confidence.map { CVPixelBufferGetHeight($0) } ?? 0
+        let cs = confidence.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
+        guard confidence == nil || (conf != nil && cw > 0 && ch > 0) else {
+            reject("empty_confidence_buffer"); return
+        }
+        var k = frame.camera.intrinsics
+        let sx = Float(w) / Float(imageSize.width), sy = Float(h) / Float(imageSize.height)
+        k.columns.0.x *= sx; k.columns.1.y *= sy
+        k.columns.2.x *= sx; k.columns.2.y *= sy
+        let yaw = referenceYaw ?? body.yaw
+        let bin = ScanGeometry.yawBin(body.yaw - yaw)
+        var accepted = 0
+        var additions: [Point3D] = []
+        var newVoxels = Set<Voxel>()
+        for y in stride(from: 1, to: h - 1, by: 2) {
+            for x in stride(from: 1, to: w - 1, by: 2) {
+                let mx = x * mw / w, my = y * mh / h
+                // Reject mixed foreground/background pixels at mask boundaries.
+                guard mx >= 2, my >= 2, mx < mw - 2, my < mh - 2,
+                      [(-2,0),(2,0),(0,-2),(0,2),(0,0)].allSatisfy({
+                          masks[(my + $0.1) * ms + mx + $0.0] >= 200
+                      }) else { continue }
+                if let conf, conf[(y * ch / h) * cs + x * cw / w] < 2 { continue }
+                let z = depths[y * ds + x]
+                guard z.isFinite, [depths[y * ds + x - 1], depths[y * ds + x + 1],
+                    depths[(y - 1) * ds + x], depths[(y + 1) * ds + x]].allSatisfy({
+                        $0.isFinite && abs($0 - z) < 0.04
+                    }), let camera = ScanGeometry.unproject(pixel: SIMD2<Float>(Float(x), Float(y)), depth: z,
+                        fx: k.columns.0.x, fy: k.columns.1.y, cx: k.columns.2.x, cy: k.columns.2.y) else { continue }
+                let p = frame.camera.transform * SIMD4<Float>(camera.x, camera.y, camera.z, 1)
+                let canonical = body.canonicalPoint(SIMD3<Float>(p.x, p.y, p.z))
+                guard ScanGeometry.isFinite(canonical), abs(canonical.x) < 0.8,
+                      abs(canonical.y) < 1.4, abs(canonical.z) < 0.7 else { continue }
+                accepted += 1
+                let voxel = Voxel(canonical)
+                if anglePoints[bin].count + additions.count < maxPointsPerAngle,
+                   !angleVoxels[bin].contains(voxel), newVoxels.insert(voxel).inserted {
+                    additions.append(Point3D(canonical.x, canonical.y, canonical.z))
+                }
+            }
+        }
+        if accepted >= 30 {
+            anglePoints[bin].append(contentsOf: additions)
+            angleVoxels[bin].formUnion(newVoxels)
+            referenceYaw = yaw; depthSource = source
+            angularBins.insert(bin); acceptedDepthFrames += 1
+        } else { reject("too_few_valid_depth_pixels") }
+    }
+
+    private func finalizeScan() {
+        let points = anglePoints.flatMap { $0 }
+        let coverage = Double(angularBins.count) / Double(ScanGeometry.yawBinCount)
+        let sections = BodyAnalysisEngine.analyzeCrossSections(canonicalPoints: points,
+            torsoHeightMeters: median(torsoHeights.map(Double.init)) ?? .nan,
+            shoulderWidthMeters: median(shoulderWidths.map(Double.init)) ?? .nan, angularCoverage: coverage)
+        var metrics = workingMetrics
+        metrics.shoulderWidthCm = sampleMedian(\.shoulderWidthCm)
+        metrics.shoulderHeightDifferenceCm = sampleMedian(\.shoulderHeightDifferenceCm)
+        metrics.leftArmLengthCm = sampleMedian(\.leftArmLengthCm)
+        metrics.rightArmLengthCm = sampleMedian(\.rightArmLengthCm)
+        metrics.skeletonAgreementCm = sampleMedian(\.skeletonAgreementCm)
+        metrics.chestCircumferenceCm = sections.chest?.perimeterCm
+        metrics.waistCircumferenceCm = sections.waist?.perimeterCm
+        metrics.hipCircumferenceCm = sections.hip?.perimeterCm
+        metrics.chestWidthCm = sections.chest?.widthCm; metrics.chestDepthCm = sections.chest?.depthCm
+        metrics.waistWidthCm = sections.waist?.widthCm; metrics.waistDepthCm = sections.waist?.depthCm
+        metrics.hipWidthCm = sections.hip?.widthCm; metrics.hipDepthCm = sections.hip?.depthCm
+        let allSections = [sections.chest, sections.waist, sections.hip].compactMap { $0 }
+        metrics.sectionConfidence = allSections.count == 3 ? allSections.map(\.confidence).min() : nil
+        var warnings = ["研究用估算；采样完整度不是准确率，须与版师实测对照。",
+                        "骨架位置仍由视觉模型估计；深度与骨架的配准偏差须用真机验证。"]
+        if depthSource != "lidar_scene_depth" {
+            warnings.append("没有使用硬件 LiDAR 深度；推断人体深度不能视为真实表面测量。")
+        }
+        if allSections.count < 3 { warnings.append("截面或角度覆盖不足，请重扫；缺失围度不予补猜。") }
+        let duration = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let export = ScanExport(version: "0.3.1-accuracy-audit", createdAt: Date(), inputHeightCm: heightCm,
+            durationSeconds: duration, capturedFrameCount: totalFrames, applePoseFrameCount: poseFrames.count,
+            mediaPipeFrameCount: mpFrames, angularCoveragePercent: coverage * 100,
+            pointCloudPointCount: points.count, personDepthAvailable: depthSource == "inferred_person_depth",
+            lidarSceneDepthAvailable: depthSource == "lidar_scene_depth", latestMetrics: metrics,
+            chestSection: sections.chest, waistSection: sections.waist, hipSection: sections.hip,
+            poseFrames: poseFrames, pointCloud: points, depthSource: depthSource,
+            rejectedFrames: rejectedFrames, acceptedDepthFrames: acceptedDepthFrames,
+            measurementWarnings: warnings, depthScaleApplied: 1)
+        var url: URL?
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(export)
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(
-                    "body-scan-v0.3-\(Int(Date().timeIntervalSince1970)).json"
-                )
-            try data.write(to: url, options: .atomic)
-            return url
-        } catch {
-            statusText = "导出失败: \(error.localizedDescription)"
-            return nil
+            let target = FileManager.default.temporaryDirectory
+                .appendingPathComponent("body-scan-v0.3.1-\(UUID().uuidString).json")
+            try encoder.encode(export).write(to: target, options: .atomic)
+            url = target
+        } catch { /* Keep measurements visible and report export failure below. */ }
+        let resultURL = url
+        let finalMetrics = metrics
+        let message = resultURL == nil ? "结果导出失败，请重试"
+            : allSections.count == 3 ? "已生成研究用截面，请与版师实测对照" : "采样不足，请重扫；诊断数据可导出"
+        DispatchQueue.main.async {
+            self.latestMetrics = finalMetrics; self.exportURL = resultURL
+            self.angularCoverage = coverage; self.pointCloudCount = points.count
+            self.isScanning = false; self.isProcessing = false; self.statusText = message
         }
     }
 
-    private func median(_ values: [Float]) -> Float? {
+    private func sampleMedian(_ key: KeyPath<TailoringMetrics, Double?>) -> Double? {
+        median(metricSamples.compactMap { $0[keyPath: key] })
+    }
+    private func median(_ input: [Double]) -> Double? {
+        let values = input.filter(\.isFinite).sorted()
         guard !values.isEmpty else { return nil }
-        let sorted = values.sorted()
-        let middle = sorted.count / 2
-        if sorted.count % 2 == 0 {
-            return (sorted[middle - 1] + sorted[middle]) * 0.5
-        }
-        return sorted[middle]
+        return (values[(values.count - 1) / 2] + values[values.count / 2]) / 2
     }
 }
