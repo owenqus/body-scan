@@ -36,8 +36,8 @@ enum BodyAnalysisEngine {
         guard
             let aLeftHip = apple["leftHip"],
             let aRightHip = apple["rightHip"],
-            let aLeftShoulder = apple["leftShoulder"],
-            let aRightShoulder = apple["rightShoulder"],
+            apple["leftShoulder"] != nil,
+            apple["rightShoulder"] != nil,
             mediaPipe.count > 28,
             appleCalibrationScale.isFinite, appleCalibrationScale > 0,
             apple.values.allSatisfy(ScanGeometry.isFinite),

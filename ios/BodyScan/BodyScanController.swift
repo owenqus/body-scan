@@ -363,6 +363,8 @@ final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
         let yaw = referenceYaw ?? body.yaw
         let bin = ScanGeometry.yawBin(body.yaw - yaw)
         var accepted = 0
+        var additions: [Point3D] = []
+        var newVoxels = Set<Voxel>()
         for y in stride(from: 1, to: h - 1, by: 2) {
             for x in stride(from: 1, to: w - 1, by: 2) {
                 let mx = x * mw / w, my = y * mh / h
@@ -383,13 +385,16 @@ final class BodyScanController: NSObject, ObservableObject, ARSessionDelegate {
                 guard ScanGeometry.isFinite(canonical), abs(canonical.x) < 0.8,
                       abs(canonical.y) < 1.4, abs(canonical.z) < 0.7 else { continue }
                 accepted += 1
-                if anglePoints[bin].count < maxPointsPerAngle,
-                   angleVoxels[bin].insert(Voxel(canonical)).inserted {
-                    anglePoints[bin].append(Point3D(canonical.x, canonical.y, canonical.z))
+                let voxel = Voxel(canonical)
+                if anglePoints[bin].count + additions.count < maxPointsPerAngle,
+                   !angleVoxels[bin].contains(voxel), newVoxels.insert(voxel).inserted {
+                    additions.append(Point3D(canonical.x, canonical.y, canonical.z))
                 }
             }
         }
         if accepted >= 30 {
+            anglePoints[bin].append(contentsOf: additions)
+            angleVoxels[bin].formUnion(newVoxels)
             referenceYaw = yaw; depthSource = source
             angularBins.insert(bin); acceptedDepthFrames += 1
         } else { reject("too_few_valid_depth_pixels") }
